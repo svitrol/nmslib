@@ -63,6 +63,7 @@ namespace similarity {
         int curNodeNum = enterpointId_;
         dist_t curdist = (fstdistfunc_(
             pVectq, (float *)(data_level0_memory_ + enterpointId_ * memoryPerObject_ + offsetData_ + 16), qty, TmpRes));
+        query->distance_computations_++;
 
         for (int i = maxlevel1; i > 0; i--) {
             bool changed = true;
@@ -73,9 +74,7 @@ namespace similarity {
                 for (int j = 1; j <= size; j++) {
                     PREFETCH(data_level0_memory_ + (*(data + j)) * memoryPerObject_ + offsetData_, _MM_HINT_T0);
                 }
-#ifdef DIST_CALC
                 query->distance_computations_ += size;
-#endif
 
                 for (int j = 1; j <= size; j++) {
                     int tnum = *(data + j);
@@ -103,6 +102,9 @@ namespace similarity {
         query->CheckAndAddToResult(curdist, data_rearranged_[curNodeNum]);
         massVisited[curNodeNum] = currentV;
 
+        size_t patienceCounter = 0;
+        size_t k = query->GetK();
+
         while (!candidateQueuei.empty()) {
             EvaluatedMSWNodeInt<dist_t> currEv = candidateQueuei.top(); // This one was already compared to the query
 
@@ -125,27 +127,36 @@ namespace similarity {
                 PREFETCH((char *)(massVisited + *(data + j + 1)), _MM_HINT_T0);
                 PREFETCH(data_level0_memory_ + (*(data + j + 1)) * memoryPerObject_ + offsetData_, _MM_HINT_T0);
                 if (!(massVisited[tnum] == currentV)) {
-#ifdef DIST_CALC
                     query->distance_computations_++;
-#endif
                     massVisited[tnum] = currentV;
                     char *currObj1 = (data_level0_memory_ + tnum * memoryPerObject_ + offsetData_);
                     dist_t d = (fstdistfunc_(pVectq, (float *)(currObj1 + 16), qty, TmpRes));
+
                     if (closestDistQueuei.top().getDistance() > d || closestDistQueuei.size() < ef_) {
+                        bool improved = query->CheckAndAddToResult(d, data_rearranged_[tnum]);
+                        if (patience_ > 0 && improved && (100.0 * (k - 1) / k < patienceThreshold_)) {
+                            patienceCounter = 0;
+                        }
                         candidateQueuei.emplace(-d, tnum);
                         PREFETCH(data_level0_memory_ + candidateQueuei.top().element * memoryPerObject_ + offsetLevel0_,
                                      _MM_HINT_T0);
-                        // query->CheckAndAddToResult(d, new Object(currObj1));
-                        query->CheckAndAddToResult(d, data_rearranged_[tnum]);
                         closestDistQueuei.emplace(d, tnum);
 
                         if (closestDistQueuei.size() > ef_) {
                             closestDistQueuei.pop();
                         }
                     }
+
+                    if (patience_ > 0) {
+                        patienceCounter++;
+                        if (patienceCounter >= patience_) {
+                            goto end_search;
+                        }
+                    }
                 }
             }
         }
+    end_search:
         visitedlistpool->releaseVisitedList(vl);
     }
 
@@ -169,6 +180,7 @@ namespace similarity {
         int curNodeNum = enterpointId_;
         dist_t curdist = (fstdistfunc_(
             pVectq, (float *)(data_level0_memory_ + enterpointId_ * memoryPerObject_ + offsetData_ + 16), qty, TmpRes));
+        query->distance_computations_++;
 
         for (int i = maxlevel1; i > 0; i--) {
             bool changed = true;
@@ -179,9 +191,7 @@ namespace similarity {
                 for (int j = 1; j <= size; j++) {
                     PREFETCH(data_level0_memory_ + (*(data + j)) * memoryPerObject_ + offsetData_, _MM_HINT_T0);
                 }
-#ifdef DIST_CALC
                 query->distance_computations_ += size;
-#endif
 
                 for (int j = 1; j <= size; j++) {
                     int tnum = *(data + j);
@@ -206,9 +216,16 @@ namespace similarity {
         vector<QueueItem> &queueData = sortedArr.get_data();
         vector<QueueItem> itemBuff(1 + max(maxM_, maxM0_));
 
+        size_t patienceCounter = 0;
+        size_t k = query->GetK();
+
         massVisited[curNodeNum] = currentV;
 
         while (currElem < min(sortedArr.size(), ef_)) {
+            if (patience_ > 0 && patienceCounter >= patience_) {
+                break;
+            }
+
             auto &e = queueData[currElem];
             CHECK(!e.used);
             e.used = true;
@@ -230,18 +247,27 @@ namespace similarity {
                 PREFETCH((char *)(massVisited + *(data + j + 1)), _MM_HINT_T0);
                 PREFETCH(data_level0_memory_ + (*(data + j + 1)) * memoryPerObject_ + offsetData_, _MM_HINT_T0);
                 if (!(massVisited[tnum] == currentV)) {
-#ifdef DIST_CALC
                     query->distance_computations_++;
-#endif
                     massVisited[tnum] = currentV;
                     char *currObj1 = (data_level0_memory_ + tnum * memoryPerObject_ + offsetData_);
                     dist_t d = (fstdistfunc_(pVectq, (float *)(currObj1 + 16), qty, TmpRes));
 
                     if (d < topKey || sortedArr.size() < ef_) {
+                        if (patience_ > 0) {
+                            bool inTopK = (sortedArr.size() < k || d < queueData[k - 1].key);
+                            if (inTopK && (100.0 * (k - 1) / k < patienceThreshold_)) {
+                                patienceCounter = 0;
+                            }
+                        }
+
                         CHECK_MSG(itemBuff.size() > itemQty,
                                   "Perhaps a bug: buffer size is not enough " + 
                                   ConvertToString(itemQty) + " >= " + ConvertToString(itemBuff.size()));
                         itemBuff[itemQty++] = QueueItem(d, tnum);
+                    }
+
+                    if (patience_ > 0) {
+                        patienceCounter++;
                     }
                 }
             }

@@ -119,6 +119,8 @@ namespace similarity {
         , data_level0_memory_(nullptr)
         , linkLists_(nullptr)
         , fstdistfunc_(nullptr)
+        , patience_(0)
+        , patienceThreshold_(100.0f)
     {
     }
 
@@ -483,6 +485,9 @@ namespace similarity {
         pmgr.GetParamOptional("ef", ef_, 20);
         pmgr.GetParamOptional("efSearch", ef_, ef_);
 
+        pmgr.GetParamOptional("patience", patience_, 0);
+        pmgr.GetParamOptional("patienceThreshold", patienceThreshold_, 100.0f);
+
         int tmp;
         pmgr.GetParamOptional(
             "searchMethod", tmp, 0); // this is just to prevent terminating the program when searchMethod is specified
@@ -503,6 +508,8 @@ namespace similarity {
         pmgr.CheckUnused();
         LOG(LIB_INFO) << "Set HNSW query-time parameters:";
         LOG(LIB_INFO) << "ef(Search)         =" << ef_;
+        LOG(LIB_INFO) << "patience           =" << patience_;
+        LOG(LIB_INFO) << "patienceThreshold  =" << patienceThreshold_;
         LOG(LIB_INFO) << "algoType           =" << searchAlgoType_;
     }
 
@@ -1122,11 +1129,13 @@ namespace similarity {
         massVisited[curNode->getId()] = currentV;
         // visitedQueue.insert(curNode->getId());
 
+        size_t patienceCounter = 0;
+        size_t k = query->GetK();
+
         ////////////////////////////////////////////////////////////////////////////////
         // PHASE TWO OF THE SEARCH
         // Extraction of the neighborhood to find k nearest neighbors.
         ////////////////////////////////////////////////////////////////////////////////
-
         while (!candidateQueue.empty()) {
             auto iter = candidateQueue.top(); // This one was already compared to the query
             const HnswNodeDistFarther<dist_t> &currEv = iter;
@@ -1141,15 +1150,13 @@ namespace similarity {
 
             const vector<HnswNode *> &neighbor = (initNode)->getAllFriends(0);
 
-            size_t curId;
-
             for (auto iter = neighbor.begin(); iter != neighbor.end(); ++iter) {
                 PREFETCH((char *)(*iter)->getData(), _MM_HINT_T0);
                 PREFETCH((char *)(massVisited + (*iter)->getId()), _MM_HINT_T0);
             }
             // calculate distance to each neighbor
             for (auto iter = neighbor.begin(); iter != neighbor.end(); ++iter) {
-                curId = (*iter)->getId();
+                size_t curId = (*iter)->getId();
 
                 if (!(massVisited[curId] == currentV)) {
                     massVisited[curId] = currentV;
@@ -1157,17 +1164,28 @@ namespace similarity {
                     d = query->DistanceObjLeft(currObj);
                     if (closestDistQueue1.top().getDistance() > d || closestDistQueue1.size() < ef_) {
                         {
-                            query->CheckAndAddToResult(d, currObj);
+                            bool improved = query->CheckAndAddToResult(d, currObj);
+                            if (patience_ > 0 && improved && (100.0 * (k - 1) / k < patienceThreshold_)) {
+                                patienceCounter = 0;
+                            }
                             candidateQueue.emplace(d, *iter);
                             closestDistQueue1.emplace(d, *iter);
                             if (closestDistQueue1.size() > ef_) {
                                 closestDistQueue1.pop();
                             }
                         }
+
+                        if (patience_ > 0) {
+                            patienceCounter++;
+                            if (patienceCounter >= patience_) {
+                                goto end_search;
+                            }
+                        }
                     }
                 }
             }
         }
+    end_search:
         visitedlistpool->releaseVisitedList(vl);
     }
 
@@ -1218,6 +1236,9 @@ namespace similarity {
         vector<QueueItem> &queueData = sortedArr.get_data();
         vector<QueueItem> itemBuff(1 + max(maxM_, maxM0_));
 
+        size_t patienceCounter = 0;
+        size_t k = query->GetK();
+
         massVisited[curNode->getId()] = currentV;
         // visitedQueue.insert(curNode->getId());
 
@@ -1225,8 +1246,11 @@ namespace similarity {
         // PHASE TWO OF THE SEARCH
         // Extraction of the neighborhood to find k nearest neighbors.
         ////////////////////////////////////////////////////////////////////////////////
-
         while (currElem < min(sortedArr.size(), ef_)) {
+            if (patience_ > 0 && patienceCounter >= patience_) {
+                break;
+            }
+
             auto &e = queueData[currElem];
             CHECK(!e.used);
             e.used = true;
@@ -1235,8 +1259,6 @@ namespace similarity {
 
             size_t itemQty = 0;
             dist_t topKey = sortedArr.top_key();
-
-            const vector<HnswNode *> &neighbor = (initNode)->getAllFriends(0);
 
             size_t curId;
 
@@ -1256,10 +1278,22 @@ namespace similarity {
                     d = query->DistanceObjLeft(currObj);
 
                     if (d < topKey || sortedArr.size() < ef_) {
+                        if (patience_ > 0) {
+                            // Heuristic check: does it improve the top-K currently in the pool?
+                            bool inTopK = (sortedArr.size() < k || d < queueData[k - 1].key);
+                            if (inTopK && (100.0 * (k - 1) / k < patienceThreshold_)) {
+                                patienceCounter = 0;
+                            }
+                        }
+
                         CHECK_MSG(itemBuff.size() > itemQty,
                                   "Perhaps a bug: buffer size is not enough " + 
                                   ConvertToString(itemQty) + " >= " + ConvertToString(itemBuff.size()));
                         itemBuff[itemQty++] = QueueItem(d, *iter);
+                    }
+
+                    if (patience_ > 0) {
+                        patienceCounter++;
                     }
                 }
             }
