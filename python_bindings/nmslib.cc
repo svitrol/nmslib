@@ -136,7 +136,7 @@ struct IndexWrapper {
       index->Search(&knn, -1);
     }
     std::unique_ptr<KNNQueue<dist_t>> res(knn.Result()->Clone());
-    return convertResult(res.get());
+    return convertResult(res.get(), knn.DistanceComputations());
   }
 
   py::object knnQueryBatch(py::object input, size_t k, int num_threads) {
@@ -147,6 +147,7 @@ struct IndexWrapper {
     ObjectVector queries;
     readObjectVector(input, &queries);
     std::vector<std::unique_ptr<KNNQueue<dist_t>>> results(queries.size());
+    std::vector<size_t> computations(queries.size());
     {
       py::gil_scoped_release l;
 
@@ -154,6 +155,7 @@ struct IndexWrapper {
         KNNQuery<dist_t> knn(*space, queries[query_index], k);
         index->Search(&knn, -1);
         results[query_index].reset(knn.Result()->Clone());
+        computations[query_index] = knn.DistanceComputations();
       });
 
       // TODO(@benfred): some sort of RAII auto-destroy for this
@@ -161,13 +163,13 @@ struct IndexWrapper {
     }
 
     py::list ret;
-    for (auto & result : results) {
-      ret.append(convertResult(result.get()));
+    for (size_t i = 0; i < results.size(); ++i) {
+      ret.append(convertResult(results[i].get(), computations[i]));
     }
     return ret;
   }
 
-  py::object convertResult(KNNQueue<dist_t> * res) {
+  py::object convertResult(KNNQueue<dist_t> * res, size_t dist_comps) {
     // Create numpy arrays for the output
     size_t size = res->Size();
     py::array_t<int> ids(size);
@@ -180,7 +182,7 @@ struct IndexWrapper {
       distances.mutable_at(size) = res->TopDistance();
       res->Pop();
     }
-    return py::make_tuple(ids, distances);
+    return py::make_tuple(ids, distances, dist_comps);
   }
 
   const Object * readObject(py::object input, int id = 0) {
@@ -554,7 +556,9 @@ void exportIndex(py::module * m) {
       "ids: array_like.\n"
       "    A 1D vector of the ids of each nearest neighbour.\n"
       "distances: array_like.\n"
-      "    A 1D vector of the distance to each nearest neigbhour.\n")
+      "    A 1D vector of the distance to each nearest neigbhour.\n"
+      "computations: int.\n"
+      "    The number of distance computations performed.\n")
 
     .def("knnQueryBatch", &IndexWrapper<dist_t>::knnQueryBatch,
       py::arg("queries"), py::arg("k") = 10, py::arg("num_threads") = 0,
@@ -572,7 +576,7 @@ void exportIndex(py::module * m) {
       "Returns\n"
       "----------\n"
       "list:\n"
-      "   A list of tuples of (ids, distances)\n ")
+      "   A list of tuples of (ids, distances, computations)\n ")
 
     .def("loadIndex", &IndexWrapper<dist_t>::loadIndex,
       py::arg("filename"),
